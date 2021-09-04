@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/csv"
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -17,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/joho/godotenv"
+	"github.com/valyala/fastjson"
 )
 
 func exitErrorf(msg string, args ...interface{}) {
@@ -95,6 +95,7 @@ func main() {
 
 	var dealsAWS []Deal
 
+	// simplified parses that assumes data is correct
 	for _, row := range rec[1:] {
 		value, err := strconv.ParseFloat(string(row[2]), 8)
 		if err != nil {
@@ -112,7 +113,7 @@ func main() {
 
 	fmt.Println(dealsAWS[:10], '\n')
 
-	// get and process data from pipedrive api
+	// get and process deals from pipedrive api
 	resp, err := http.Get(pipedBaseURL + "/api/v1/deals:(title,value)?api_token=" + os.Getenv("PIPED_TOKEN"))
 
 	if err != nil {
@@ -125,13 +126,33 @@ func main() {
 		exitErrorf("unable to read response body, %v", err)
 	}
 
-	m := make(map[string]interface{})
-	err = json.Unmarshal(body, &m)
-	// var dealsPiped []Deal
+	var JSONparser fastjson.Parser
+
+	v, err := JSONparser.ParseBytes(body)
 
 	if err != nil {
-		exitErrorf("unable to map data to json format, %v", err)
+		exitErrorf("unable to parse json, %v", err)
 	}
+
+	data := v.GetArray("data")
+
+	var dealsPiped []Deal
+
+	for _, v := range data {
+		val := v.GetFloat64("value")
+		tit := v.GetStringBytes("title")
+
+		d := Deal{
+			Value: val,
+			Title: string(tit),
+		}
+
+		dealsPiped = append(dealsPiped, d)
+	}
+
+	// compare values
+
+	fmt.Print(dealsPiped)
 
 	// want to use map to get only certain fields and avoid writing the whole structure for a deal
 	// send it as is because in the email estimated finishing the task by the end of Friday
