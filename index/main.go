@@ -49,6 +49,7 @@ func main() {
 	dealsAWS := make(map[string]Deal)
 
 	// a simplified parser that assumes data is correct
+	//
 	// making pointer to maps isn't strightforward in go
 	// decided to leave it as is and not spend extra time on Sunday evening
 	for _, row := range dataCSV[1:] {
