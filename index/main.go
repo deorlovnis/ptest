@@ -44,14 +44,14 @@ func main() {
 
 	getS3Data(buf)
 
-	dataSCV := prepCSV(buf)
+	dataCSV := prepCSV(buf)
 
 	dealsAWS := make(map[string]Deal)
 
-	// simplified parses that assumes data is correct
+	// a simplified parser that assumes data is correct
 	// making pointer to maps isn't strightforward in go
 	// decided to leave it as is and not spend extra time on Sunday evening
-	for _, row := range dataSCV[1:] {
+	for _, row := range dataCSV[1:] {
 		value, err := strconv.ParseFloat(string(row[2]), 8)
 		if err != nil {
 			exitErrorf("Unable to  parse csv row, %v", err)
