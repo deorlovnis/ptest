@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -19,17 +21,13 @@ import (
 	"github.com/valyala/fastjson"
 )
 
-func exitErrorf(msg string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, msg+"\n", args...)
-	os.Exit(1)
-}
-
 // hardcoded because there is no case in this task that it might be different
 // could be requested via command line args to make it more of a real tool
 const (
-	pipedBaseURL = "https://testcomp3.pipedrive.com"
-	bucket       = "pdw-export.zulu"
-	item         = "test_tasks/deals.csv.gz"
+	PDBASEURL = "https://testcomp3.pipedrive.com"
+	BUCKET    = "pdw-export.zulu"
+	ITEM      = "test_tasks/deals.csv.gz"
+	REGION    = "eu-central-1"
 )
 
 type Deal struct {
@@ -40,66 +38,23 @@ type Deal struct {
 }
 
 func main() {
-	// prepare environment
-	err := godotenv.Load()
-
-	if err != nil {
-		exitErrorf("Unable to load .env, %v", err)
-	}
-
-	// get data from aws
-	sess, err := session.NewSession(&aws.Config{
-		// the region is hardcoded for the same reason as bucket and item
-		Region:      aws.String("eu-central-1"),
-		Credentials: credentials.NewEnvCredentials(),
-	})
-
-	// used this to look up for correct region.
-	// region, err := s3manager.GetBucketRegion(context.TODO(), sess, bucket, "us-west-2")
-	// fmt.Print(region)
-
-	if err != nil {
-		exitErrorf("Unable to initialize creds, %v", err)
-	}
-
-	downloader := s3manager.NewDownloader(sess)
+	prepEnv()
 
 	buf := aws.NewWriteAtBuffer([]byte{})
 
-	_, err = downloader.Download(buf,
-		&s3.GetObjectInput{
-			Bucket: aws.String(bucket),
-			Key:    aws.String(item),
-		})
-	if err != nil {
-		exitErrorf("Unable to download item %q, %v", item, err)
-	}
+	getS3Data(buf)
 
-	// unzip dataset and parse it to cash
-	// parsing to cash is also a sacrifice for the sake of this test
-	// in case something crashes before data was successfully sent
-	// the whole process would need to be repeated
-	// probably a better way would be to save data in chunks or send it in chunks
-	gr, err := gzip.NewReader(bytes.NewBuffer(buf.Bytes()))
+	dataSCV := prepCSV(buf)
 
-	if err != nil {
-		exitErrorf("unadble to read gzip, %v", err)
-	}
-	defer gr.Close()
-
-	cr := csv.NewReader(gr)
-	rec, err := cr.ReadAll()
-	if err != nil {
-		exitErrorf("unadble to read csv, %v", err)
-	}
-
-	var dealsAWS []Deal
+	dealsAWS := make(map[string]Deal)
 
 	// simplified parses that assumes data is correct
-	for _, row := range rec[1:] {
+	// making pointer to maps isn't strightforward in go
+	// decided to leave it as is and not spend extra time on Sunday evening
+	for _, row := range dataSCV[1:] {
 		value, err := strconv.ParseFloat(string(row[2]), 8)
 		if err != nil {
-			exitErrorf("unable to  parse csv row, %v", err)
+			exitErrorf("Unable to  parse csv row, %v", err)
 		}
 		d := Deal{
 			Title:    string(row[0]),
@@ -108,37 +63,16 @@ func main() {
 			Status:   string(row[3]),
 		}
 
-		dealsAWS = append(dealsAWS, d)
+		dealsAWS[d.Title] = d
 	}
 
-	fmt.Println(dealsAWS[:10], '\n')
+	bodyBytes := getPipeData()
 
-	// get and process deals from pipedrive api
-	resp, err := http.Get(pipedBaseURL + "/api/v1/deals:(title,value)?api_token=" + os.Getenv("PIPED_TOKEN"))
+	dataJSON := getJSONdata(bodyBytes)
 
-	if err != nil {
-		exitErrorf("unable to dowdload data from pipedrive API, %v", err)
-	}
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	dealsPiped := make(map[string]Deal)
 
-	if err != nil {
-		exitErrorf("unable to read response body, %v", err)
-	}
-
-	var JSONparser fastjson.Parser
-
-	v, err := JSONparser.ParseBytes(body)
-
-	if err != nil {
-		exitErrorf("unable to parse json, %v", err)
-	}
-
-	data := v.GetArray("data")
-
-	var dealsPiped []Deal
-
-	for _, v := range data {
+	for _, v := range dataJSON {
 		val := v.GetFloat64("value")
 		tit := v.GetStringBytes("title")
 
@@ -147,16 +81,155 @@ func main() {
 			Title: string(tit),
 		}
 
-		dealsPiped = append(dealsPiped, d)
+		dealsPiped[d.Title] = d
 	}
 
-	// compare values
+	// compare and update data
+	for _, v := range dealsAWS {
+		if val, ok := dealsPiped[v.Title]; ok {
+			// update pipidrive value with AWS value
+			if val.Value != v.Value {
+				val.Value = v.Value
+			}
+		} else {
+			dealsPiped[v.Title] = v
+		}
+	}
 
-	fmt.Print(dealsPiped)
+	updateAPIdata(&dealsPiped)
+}
 
-	// want to use map to get only certain fields and avoid writing the whole structure for a deal
-	// send it as is because in the email estimated finishing the task by the end of Friday
-	// TODO:
-	//		1. compare data from pipedrive api and s3; update api in case of value change
-	//		2. send updated data if any to pipedrive api
+func prepEnv() {
+	err := godotenv.Load()
+
+	if err != nil {
+		exitErrorf("Unable to load .env, %v", err)
+	}
+}
+
+// to make errors a bit more readable
+// and making sure that the program stops
+func exitErrorf(msg string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, msg+"\n", args...)
+
+	os.Exit(1)
+}
+
+func getS3Data(buf *aws.WriteAtBuffer) {
+	sess, err := session.NewSession(&aws.Config{
+		Region:      aws.String(REGION),
+		Credentials: credentials.NewEnvCredentials(),
+	})
+
+	if err != nil {
+		exitErrorf("Unable to initialize creds, %v", err)
+	}
+
+	downloader := s3manager.NewDownloader(sess)
+
+	_, err = downloader.Download(buf,
+		&s3.GetObjectInput{
+			Bucket: aws.String(BUCKET),
+			Key:    aws.String(ITEM),
+		})
+
+	if err != nil {
+		exitErrorf("Unable to download item %q, %v", ITEM, err)
+	}
+}
+
+func prepCSV(buf *aws.WriteAtBuffer) [][]string {
+	gr, err := gzip.NewReader(bytes.NewBuffer(buf.Bytes()))
+
+	if err != nil {
+		exitErrorf("Unadble to read gzip, %v", err)
+	}
+
+	defer gr.Close()
+
+	cr := csv.NewReader(gr)
+
+	dataCSV, err := cr.ReadAll()
+
+	if err != nil {
+		exitErrorf("Unadble to read csv, %v", err)
+	}
+
+	return dataCSV
+}
+
+func getPipeData() []byte {
+	resp, err := http.Get(PDBASEURL + "/api/v1/deals:(title,value)?api_token=" + os.Getenv("PIPED_TOKEN"))
+
+	if err != nil {
+		exitErrorf("Unable to dowdload data from pipedrive API, %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+
+	if err != nil {
+		exitErrorf("Unable to read response body, %v", err)
+	}
+
+	return body
+}
+
+func getJSONdata(bodyBytes []byte) []*fastjson.Value {
+	var JSONparser fastjson.Parser
+
+	v, err := JSONparser.ParseBytes(bodyBytes)
+
+	if err != nil {
+		exitErrorf("Unable to parse json, %v", err)
+	}
+
+	data := v.GetArray("data")
+
+	return data
+}
+
+func updateAPIdata(deals *map[string]Deal) {
+	postURL := PDBASEURL + "/api/v1/deals?api_token=" + os.Getenv("PIPED_TOKEN")
+
+	client := &http.Client{}
+
+	i := 0
+
+	for _, v := range *deals {
+		// assuming token enables 20 request per 2 seconds
+		if i%20 == 0 {
+			time.Sleep(time.Second * 2)
+		}
+
+		j, err := json.Marshal(v)
+
+		if err != nil {
+			exitErrorf("Unable to marshal a deal to JSON, %v", err)
+		}
+
+		go postDeal(postURL, client, j)
+
+		i++
+	}
+}
+
+func postDeal(postURL string, client *http.Client, data []byte) {
+	req, err := http.NewRequest("POST", postURL, bytes.NewBuffer(data))
+
+	if err != nil {
+		exitErrorf("Unable to create a new request, %v", err)
+
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+
+	if err != nil {
+		exitErrorf("Unable to request API, %v", err)
+	}
+
+	defer resp.Body.Close()
+
+	fmt.Println("status:", resp.Status, '\n')
 }
